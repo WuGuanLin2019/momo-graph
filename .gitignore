@@ -1,0 +1,24 @@
+# 虚拟环境
+.venv/
+venv/
+
+# Python 缓存与构建产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 运行时数据（本地图谱数据体积大且是个人记忆，不入库）
+Temp/*.json
+Temp/*.backup.json
+*.backup.json
+
+# 环境变量与密钥
+.env
+*.env
+
+# 编辑器 / 系统文件
+.idea/
+.DS_Store
+Thumbs.db
