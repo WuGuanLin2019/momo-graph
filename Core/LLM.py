@@ -1,6 +1,8 @@
 import json
 import os
 import re
+from datetime import datetime
+from time import time
 
 from langchain_core.output_parsers import PydanticOutputParser, StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
@@ -50,14 +52,22 @@ class EntityDesc(BaseModel):
         default_factory=list,
         description='同一实体的其他叫法；例如"吴是Wu的别名"就把 吴 放进来，name 仍写 Wu',
     )
-    entity_type: str = Field(default="", description="人物 / 动物 / 地点 / 名称 / 物品 / 抽象概念 / 事物 之一")
+    entity_type: str = Field(default="", description="人物 / 动物 / 地点 / 书名 / 物品 / 抽象概念 / 事物 之一")
     description: str = Field(default="", description="1~2 句、30 字内：这个实体是谁/是什么，不写心情体重等状态")
+
+
+class MemoryExtractionError(ValueError):
+    """指代无法消解：这次绝不入库，让调用方补上下文后重试。"""
 
 
 class MemoryFragments(BaseModel):
     """记忆提取器的输出：整理干净、可独立入库存的片段。"""
 
     memories: list[str] = Field(default_factory=list, description="按原文顺序排列的记忆片段，一条一个场景")
+    error: str = Field(
+        default="",
+        description="指代无法消解时填失败原因（如「『他』指代不明：阿志和阿豪都可能」）；正常时留空",
+    )
 
 
 class CommunitySummary(BaseModel):
@@ -80,6 +90,46 @@ class ImportResult(BaseModel):
     entities: list[EntityDesc] = Field(default_factory=list, description="本次出现的实体的画像列表")
 
 
+class EntityRewrite(BaseModel):
+    """合并后的实体画像：由 LLM 整体重写，不是机械拼接。"""
+
+    name: str = Field(default="", description="最规范、最完整的名字")
+    aliases: list[str] = Field(default_factory=list, description="同一实体的其他叫法，不含 name 本身")
+    description: str = Field(default="", description="1~3 句稳定画像")
+    entity_type: str = Field(default="", description="人物 / 动物 / 地点 / 作品 / 物品 / 抽象概念 / 事物 之一")
+
+
+class EntityGroup(BaseModel):
+    """一个结果实体：组内成员合并成一个实体，primary_id 是保留的主实体。"""
+
+    primary_id: int = Field(default=0, description="合并后保留的主实体 id，必须是 member_ids 之一")
+    member_ids: list[int] = Field(default_factory=list, description="本组要合并的 id，至少一个；只有一个表示独立实体")
+    final: EntityRewrite = Field(default_factory=EntityRewrite, description="该结果实体重写后的画像")
+
+
+class EntityDoubt(BaseModel):
+    """两个结果实体之间还没把握的关系。"""
+
+    members: list[int] = Field(default_factory=list, description="存疑涉及的各组 primary_id，至少两个")
+    question: str = Field(default="", description="一句能回答的问题")
+    reason: str = Field(default="", description="为什么拿不准")
+
+
+class ClusterResolution(BaseModel):
+    """一个候选簇的拆分结果：结果实体组 + 组间存疑关系。"""
+
+    cluster_id: int = Field(default=0, description="原样返回输入里的簇 id")
+    groups: list[EntityGroup] = Field(default_factory=list, description="本簇拆分出的结果实体组，必须覆盖所有成员且不重叠")
+    doubts: list[EntityDoubt] = Field(default_factory=list, description="组与组之间还没把握的关系")
+    reason: str = Field(default="", description="一句话说明整体依据")
+
+
+class ClusterJudgeResult(BaseModel):
+    """实体簇裁决的完整输出。"""
+
+    clusters: list[ClusterResolution] = Field(default_factory=list)
+
+
 class LLM_Adapter:
     def __init__(self):
         # 通过环境变量配置，默认指向 DeepSeek，兼容任意 OpenAI 风格接口
@@ -93,6 +143,7 @@ class LLM_Adapter:
         self._community_upper_chain = None
         self._community_rewrite_chain = None
         self._triple_chain = None
+        self._dedup_chain = None
 
     _EXTRACT_SYSTEM = """你叫 MOMO，是由 Wu 创造的 AI。你的任务是把一段原始输入整理成若干条「记忆片段」，供长期记忆图谱入库。
 
@@ -112,8 +163,7 @@ class LLM_Adapter:
 【指代消解】
 - 每条片段都要能脱离上下文读懂：谁、对谁、做了什么/说了什么/怕什么，必须在片段内说清楚。
 - 名词指代：把"他/她/它/这个/那个"、省略的主语替换成原文里明确出现的名字。
-  用户是 Wu，我是 MOMO。原文指用户或创造者 → 写"Wu"；指 AI 或 MOMO → 写"我"。
-  用户说"我""我的"时指的是用户自己，要写成"Wu"，不要照抄成"我"。
+  能指认到唯一对象才替换；同一段里有多个候选、或者原文根本没说清是谁，不要猜，按下面【指代消不了就报错】处理。
 - 事件指代 / 省略宾语："说、告诉、问、答应、怕、觉得、担心"后面如果只有人、没有内容，
   要从上下文把内容补出来，写成完整句子：
   "路人告诉了阿豪。" → "路人把自己喜欢阿志的事告诉了阿豪。"
@@ -121,11 +171,31 @@ class LLM_Adapter:
 - 不许留半截句："告诉了某人。""说了什么。"这类必须补全。
 - 可以压缩啰嗦的表达，但不许改变事实含义。
 
-【例子】
-"嗯…我今天跟罗小姐出去玩了，然后一起喝了奶茶，原来她喜欢阿嬷手作的奶茶。"
-→ memories = ["Wu 今天和罗小姐出去玩，一起喝了奶茶。", "罗小姐喜欢阿嬷手作的奶茶。"]
+【指代消不了就报错：别猜、别存半成品】
+- 只要有一处代词或省略无法确定指向谁（比如"他"在同一段里可能是阿志也可能是阿豪，
+  或者原文只写"他/你"而没有任何说话人标识），整次提取就算失败：
+  memories 留空，error 字段写清原因，例如 error = "『他』指代不明：阿志和阿豪都可能"。
+- 失败时只输出 error，不要输出部分片段——调用方会补上对话上下文再整段重发。
+- 这个报错不是让你保守：能唯一定位就正常整理，只有当原文信息量确实不够时才报。
 
-输出 JSON，只含 memories 字段，值是按原文顺序排列的片段列表。"""
+【时间指代消解】
+- 原文里的相对时间一律换成具体日期，按输入给出的「当前时间」推算：
+  今天 / 昨天 / 前天 / 大前天、明天 / 后天、上周三 / 下个月 / 去年、三天前、半小时前……
+  写法统一成 2026-10-31 这样；需要精确到小时时写 2026-10-31 14:00。
+  "前天" → 当前时间往前数两天，跨月跨年也要算对（当前 10-02 的"前天"是 09-30）。
+- "现在/刚刚/今天上午"这类如果指的就是当前这一刻，写当前日期（或带小时）即可。
+- 只改时间说法，不动别的字；换完之后不要在日期后面用括号再保留"上周三"这类原词。
+- "大概/可能/上次"这类含糊说法推不出具体日期时，保留原词，不要瞎猜。
+- 时间也是事实，原文提到了就必须留在片段里，不能因为换了写法就漏掉。
+
+【例子】
+"Wu说他，嗯…就是那个，他前天跟罗小姐出去玩了，然后一起喝了奶茶，原来她喜欢阿嬷手作的奶茶。"（当前时间 2026-10-31 14:00）
+→ memories = ["Wu 2026-10-29 和罗小姐出去玩，一起喝了奶茶。", "罗小姐喜欢阿嬷手作的奶茶。"]
+
+"他昨天又迟到了。"（没有别的人，"他"指谁说不清）
+→ error = "『他』指代不明：原文没有其他可指认的人"
+
+输出 JSON：memories 是片段列表（按原文顺序）；error 正常时为空字符串，指代消解失败时写原因。"""
 
     def _chat(self):
         return ChatOpenAI(
@@ -223,10 +293,11 @@ class LLM_Adapter:
         human = f"【已有摘要】\n{old_summary}\n\n【当前社区信息】\n{context}"
         return self._run_community(self._COMMUNITY_REWRITE_SYSTEM, human, "_community_rewrite_chain")
 
-    def extract_memories(self, text: str) -> list[str]:
+    def extract_memories(self, text: str, now: int | None = None) -> list[str]:
         """记忆提取器：把含噪音的原文整理成干净、可独立入库的记忆片段。
 
-        只做整理（切块 + 去噪 + 指代消解），不抽实体和关系；这一步的输出就是下游的 chunk。
+        只做整理（切块 + 去噪 + 指代消解 + 时间换算），不抽实体和关系；这一步的输出就是下游的 chunk。
+        now 是「当前时间」的参照点（默认此刻）：原文里的"前天""上周三"按它换算成具体日期。
         """
         if not text.strip():
             return []
@@ -239,13 +310,23 @@ class LLM_Adapter:
             prompt = ChatPromptTemplate.from_messages(
                 [
                     ("system", self._EXTRACT_SYSTEM + "\n\n{format_instructions}"),
-                    ("human", "{text}"),
+                    ("human", "【当前时间】{now}\n\n【原文】\n{text}"),
                 ]
             ).partial(format_instructions=parser.get_format_instructions())
             self._extract_chain = prompt | self._chat() | StrOutputParser()
 
-        raw = self._extract_chain.invoke({"text": text})
+        reference = datetime.fromtimestamp(now if now is not None else time())
+        # 带上星期几，「上周三」这种说法才有据可依
+        weekday = "一二三四五六日"[reference.weekday()]
+        raw = self._extract_chain.invoke(
+            {"now": f"{reference:%Y-%m-%d %H:%M}（星期{weekday}）", "text": text}
+        )
         parsed = MemoryFragments.model_validate(_parse_json_loose(raw))
+        if parsed.error.strip():
+            # 指代消不了：宁可这次不存，也不存半成品；调用方补上下文后再试
+            raise MemoryExtractionError(
+                f"【存取记忆失败】具体原因：{parsed.error.strip().rstrip('。')}。"
+            )
         return [memory.strip() for memory in parsed.memories if memory.strip()]
 
     @staticmethod
@@ -322,9 +403,12 @@ class LLM_Adapter:
 一条片段就是一个记忆单元：不切块、不改写原文，只抽关系、属性和实体画像。
 
 【定实体】
-- 只给"以后还会被提到、值得单独查"的东西建实体：人、宠物、作品、地点、具体物件、组织。
+- 只给"以后还会被提到、值得单独查"的东西建实体，比如：人、宠物、作品、地点、具体物件、组织。
 - 不建实体：代词、形容词、时间（昨天/上周）、数量或价格，以及"成长""时间""事情""感觉"这类泛泛的抽象词。
 - 实体名用记忆里最具体的叫法，同一实体始终用同一个名字。
+- 同名但不同类的东西必须拆成两个实体：作品（书名/片名，带书名号《》）和其中的人物（角色名，不带《》）不是一回事，
+  即使字面相同也要分开建。例：《哈利·波特》= 作品实体；哈利 / 哈利·波特（指那个男孩时）= 角色实体，分别各建一个。
+- 禁止把人物名写进作品实体的 aliases；作品实体的 aliases 只放作品自身的别称。
 - 同一个对象的变体写法（错别字、音译、简称，如 吴 / Wu、莫莫 / MOMO）统一成出现最多的那种。
 - 实体名取最简本体，去掉定语和修饰，修饰部分抽成关系。
 - 同一实体的其他叫法写进 aliases，不要为别名单独建一条实体记录：
@@ -333,17 +417,24 @@ class LLM_Adapter:
 - 别名本身不要抽成关系边（不要写 ("吴","别名是","Wu")），它只是一个叫法。
 
 【边只收常驻关系：edge_kind 四选一】
-只有这三种算边：
-- 身份：人和人之间的稳定身份/辈分（同事、前任、恋人、朋友、家人、上下级）、人养动物。
-  例：("阿杰","养","团子")、("路人","暗恋","阿志")、("阿兰","是","阿志前女友")
-- 归属：谁拥有/属于/包含/出自什么，谁是谁的一部分、谁装在哪。
-  例：("MOMO","拥有","动画工具")、("猫","属于","罗小姐")、("奶茶","出自","阿嬷手作")
+只有这三种算边，要仔细推敲一下句子里的实体之间的关系：
+- 身份：人/动物/AI之间的身份/辈分（包括但不限于不认识、点头之交、同事、朋友、观众、粉丝、前任、恋人、父亲等等）。
+  例：("阿杰","养","团子")、("路人","暗恋","阿志")、("阿兰","前女友","阿志")
+- 归属：实体拥有/属于/包含/出自什么，谁是谁的一部分、实体装在哪。
+  例：("MOMO","拥有","动画工具")、("猫","属于","生物")、("奶茶","出自","阿嬷手作")
 - 态度：稳定的喜欢/讨厌/信任/看不上，不是一次性的情绪爆发。
   例：("Wu","喜欢","不能说的秘密")
 
-其余全是「事件」（edge_kind="事件"）。一次性动作一律算事件，例如：
+其余全是「事件」（edge_kind="事件"）。人/动物/AI之间的一次性动作或短期关联一律算事件，例如：
 告诉、问、询问、提议、答应、解释、夸、提醒、追问、要求、计划、设想、建议、承诺、指出、提出、表示、认为、认同、假设、讨论、商量、决定、想要、希望。
 一次性的经历、对话、争论、道歉、玩笑，也都算事件。
+注意：身份不能用实体 description 代替：只要两实体之间确立了关系，
+  就必须额外输出一条 edge_kind="身份" 的 link（edge_str 填关系），
+  不能只在 entities.description 里写这个关系。
+
+但注意，一个信息可能是关系的同时，也是事件，比如：
+- "阿杰希望他的女朋友乐乐的病快点好。" （edge_kind="身份"），提取的就是("乐乐","女朋友","阿杰")
+- "阿杰今天终于养猫了，并给它取名：乐乐。" （edge_kind="身份"），提取的就是("乐乐","宠物","阿杰")
 
 事件的处理规则：
 - entity_source 和 entity_target 照实填，edge_str 留空，attribute_* 按需填。
@@ -356,7 +447,7 @@ class LLM_Adapter:
 - 禁止自环：entity_source 和 entity_target 不能是同一个名字。
 - 主体直接连客体，不要经过描述性名词中转。
 
-【抽属性】
+【抽属性】优先级低于抽关系
 - attribute_name 优先从词表选：心情、健康、体重、身高、年龄、职业、情感倾向、性格、技能、作用、意义、味道、表达风格、表达深度；词表没有的再新建，同一含义不要换说法。
 - attribute_value 用原文里的短值，带单位（70kg、175cm）。
 - 纯属性记忆：entity_source 填被描述的实体，entity_target 与 edge_str 留空，attribute_entity 填 "source"。
@@ -405,6 +496,166 @@ class LLM_Adapter:
             raw_links.append(item)
         link_data = self._clean_links(raw_links, len(texts))
         return {"link_data": link_data, "entities": self._clean_entities(parsed.entities)}
+
+    _DEDUP_SYSTEM = """你叫 MOMO，是由 Wu 创造的 AI。输入是一批「候选实体簇」和历史存疑记录。每个簇里的实体只是"可能同一"的候选，不是已经确认的事实。
+
+你的任务：把每个候选簇拆成若干「结果实体组」，再把组与组之间还没把握的关系写成存疑记录。
+
+【怎么分组】
+- 组内 member_ids 是你确认指向同一实体的 id；primary_id 是合并后保留的主实体，必须是 member_ids 之一，优先选名字最规范、信息最全的那个。
+- 不合并的实体单独成一组，member_ids 只有一个 id；单例也是一个结果实体，仍然要重写 final。
+- 必须覆盖本簇所有实体：每个 id 恰好出现在一个组里，不能漏、不能重复、不能跨簇。
+- 不同组之间默认就是不同实体，相当于已经完成区分；不要为了少写 doubts 硬把它们合并。
+- 只依据输入里的名字、别名、类型、描述判断，不补常识、不臆测、不猜测没说的事。
+
+【常见判断】
+- 同名不等于同一：V（《赛博朋克 2077》的角色）和 Vedal（主播）是两个实体；魂（《影之刃》的角色）和灵魂（抽象名词）也是两个。
+- 作品和作品里的角色必须分开：《哈利·波特》是作品，哈利是角色；即使字面相同、甚至作品的别名里写了角色名，也不是同一个实体。
+- 描述一致、类型一致、别名互相覆盖的，通常是同一实体的不同叫法（如 莉莉 / 莉莉·波特、邓布利多 / 阿不思·邓布利多），可以放进同一个组。
+
+【存疑怎么写】
+- 如果两组实体可能同一，但你拿不准：不要合并它们，保持两个组，并在 doubts 里写一条。
+- doubts.members 只能填各组的主实体 primary_id，至少两个；绝不能填会被合并掉的 member_id。
+- question 写一句能回答的问题，例如「83 詹姆是否就是 72 詹姆·波特？」。
+- 被写进 doubts 的实体，系统会保留它原来的画像；groups 里的 final 仍可照常写。
+
+【重写规则：每个组都要重写】
+- 不是机械保留：每个组都要重新写 name、aliases、description、entity_type，包括单例组，让画像更准确、更完整。
+- name 收敛到最规范、最完整的叫法；aliases 只放同一实体的其他叫法，去掉与 name 重复的项。
+- 多个成员合并时，把多段描述合成一段更完整的画像；独立实体之间要让描述明确区分开（比如写清各自出自哪部作品、是什么身份）。
+- entity_type 用更准确的类型（人物/动物/地点/作品/物品/抽象概念/事物 之一）。
+- 别名不能无故丢失：旧别名要么保留，要么明确迁移到本簇另一个组；迁移不了就别删。
+- 历史存疑记录里有 answer 的，答案就是证据，优先按答案裁决。
+
+【输出】
+- 只输出 clusters 数组，每簇一条，包含 cluster_id、groups、doubts、reason。
+- cluster_id 必须原样返回输入里的 id；每个输入簇都要出现，哪怕全部是单例、没有存疑。
+- 不要输出输入里不存在的 id。
+- 没有内容的字段留空或空数组，不要编造。"""
+
+    @staticmethod
+    def batch_clusters(clusters: list[dict], batch_max: int = 20) -> list[list[dict]]:
+        """按实体总数打包，簇不跨批拆开。"""
+        batches: list[list[dict]] = []
+        current: list[dict] = []
+        count = 0
+        for cluster in clusters:
+            size = len(cluster.get("entities", []))
+            if current and count + size > batch_max:
+                batches.append(current)
+                current = []
+                count = 0
+            current.append(cluster)
+            count += size
+        if current:
+            batches.append(current)
+        return batches
+
+    @staticmethod
+    def _render_dedup_input(clusters: list[dict], doubts: list[dict]) -> str:
+        doubt_payload = [
+            {
+                "members": doubt.get("members", []),
+                "question": doubt.get("question", ""),
+                "answer": doubt.get("answer", ""),
+            }
+            for doubt in doubts
+        ]
+        return (
+            "【历史存疑记录】\n"
+            + json.dumps(doubt_payload, ensure_ascii=False, indent=2)
+            + "\n\n【待裁决实体簇】\n"
+            + json.dumps(clusters, ensure_ascii=False, indent=2)
+        )
+
+    def judge_entity_clusters(
+        self,
+        clusters: list[dict],
+        doubts: list[dict] | None = None,
+        batch_max: int = 20,
+    ) -> list[dict]:
+        """把候选实体簇拆成结果实体组，并收集组间存疑。
+
+        clusters: [{"id": 0, "entities": [{"id", "name", "aliases", "entity_type", "description"}]}]
+        doubts: 存疑文档里 status=open 的记录，会注入 prompt 作为证据。
+        返回每簇一条的 {"cluster_id", "groups", "doubts", "reason"}；
+        越界 id 在这一层就过滤掉，存疑成员统一换算成各组 primary_id。
+        """
+        if not clusters:
+            return []
+        if not self.api_key:
+            raise RuntimeError(
+                "未配置 API Key。请设置环境变量 DEEPSEEK_API_KEY（可选 LLM_BASE_URL / LLM_MODEL）。"
+            )
+        if self._dedup_chain is None:
+            parser = PydanticOutputParser(pydantic_object=ClusterJudgeResult)
+            prompt = ChatPromptTemplate.from_messages(
+                [
+                    ("system", self._DEDUP_SYSTEM + "\n\n{format_instructions}"),
+                    ("human", "{input}"),
+                ]
+            ).partial(format_instructions=parser.get_format_instructions())
+            self._dedup_chain = prompt | self._chat() | StrOutputParser()
+
+        decisions: list[dict] = []
+        for batch in self.batch_clusters(clusters, batch_max):
+            raw = self._dedup_chain.invoke(
+                {"input": self._render_dedup_input(batch, doubts or [])}
+            )
+            parsed = ClusterJudgeResult.model_validate(_parse_json_loose(raw))
+            members = {
+                cluster["id"]: {entity["id"] for entity in cluster.get("entities", [])}
+                for cluster in batch
+            }
+            for decision in parsed.clusters:
+                valid_ids = members.get(decision.cluster_id)
+                # cluster_id 越界：模型多写了一簇，直接丢弃
+                if not valid_ids:
+                    continue
+                groups = []
+                id_to_primary: dict[int, int] = {}
+                for group in decision.groups:
+                    member_ids = list(
+                        dict.fromkeys(entity_id for entity_id in group.member_ids if entity_id in valid_ids)
+                    )
+                    if not member_ids:
+                        continue
+                    primary_id = group.primary_id if group.primary_id in member_ids else member_ids[0]
+                    groups.append(
+                        {
+                            "primary_id": primary_id,
+                            "member_ids": member_ids,
+                            "final": group.final.model_dump(),
+                        }
+                    )
+                    for entity_id in member_ids:
+                        id_to_primary.setdefault(entity_id, primary_id)
+                doubts = []
+                for doubt in decision.doubts:
+                    doubt_members: list[int] = []
+                    for entity_id in doubt.members:
+                        primary_id = id_to_primary.get(entity_id)
+                        if primary_id is not None and primary_id not in doubt_members:
+                            doubt_members.append(primary_id)
+                    # 不足两个主实体就构不成「组间关系」，直接丢弃
+                    if len(doubt_members) < 2:
+                        continue
+                    doubts.append(
+                        {
+                            "members": doubt_members,
+                            "question": doubt.question,
+                            "reason": doubt.reason,
+                        }
+                    )
+                decisions.append(
+                    {
+                        "cluster_id": decision.cluster_id,
+                        "groups": groups,
+                        "doubts": doubts,
+                        "reason": decision.reason,
+                    }
+                )
+        return decisions
 
 
 if __name__ == "__main__":

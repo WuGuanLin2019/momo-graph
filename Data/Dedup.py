@@ -24,14 +24,23 @@ NAME_SIM_THRESHOLD = 0.85
 class Deduplicator:
     """实体 / 边 / 属性的离线归并器。"""
 
-    def __init__(self, graph: Graph, client: EmbeddingClient | None = None):
+    def __init__(
+        self,
+        graph: Graph,
+        client: EmbeddingClient | None = None,
+        merge_string_equal: bool = False,
+    ):
         self.graph = graph
         self.client = client or EmbeddingClient()
+        # 有 LLM 时字符串相等不在确定性阶段合并，留给 LLM 裁决；无 LLM 时回退旧行为
+        self.merge_string_equal = merge_string_equal
         self._vectors_ready = False
         # 属性向量在 embedding_dict_for_attribute 里，缺号时退回按 index 对象缓存
         self._index_vectors: dict[int, list[float]] = {}
 
-    def run(self) -> dict:
+    def run(self, merge_string_equal: bool | None = None) -> dict:
+        if merge_string_equal is not None:
+            self.merge_string_equal = merge_string_equal
         e = self.dedup_entities()
         a = self.dedup_attributes()
         d = self.dedup_edges()
@@ -94,18 +103,16 @@ class Deduplicator:
         if keep.name and keep.name in drop.relate_name and drop.name not in keep.relate_name:
             return False
 
-        # 规范化名命中（大小写/全半角/空格归一）
-        if self.normalize(keep.name) == self.normalize(drop.name):
+        string_match = self.string_match(keep, drop)
+        # 实体分层：有 LLM 时字符串相等交给 LLM 裁决，确定性阶段只合「名字不等 + 余弦高」
+        if kind == "entity" and not self.merge_string_equal:
+            if string_match:
+                return False
+            return self._entity_cosine_merge(keep, drop)
+
+        # 规范化名命中（大小写/全半角/空格归一）、别名互含、别名集合有交集
+        if string_match:
             return True
-        # 别名互含：A 的本名在 B 的别名里，或反过来
-        if keep.name and keep.name in drop.relate_name:
-            return True
-        if drop.name and drop.name in keep.relate_name:
-            return True
-        # 别名集合有交集
-        for cur_name in keep.relate_name:
-            if cur_name in drop.relate_name:
-                return True
 
         # 文本不像了再比向量：实体有画像、阈值更严；边和属性名字短，阈值更松
         if kind == "entity":
@@ -123,6 +130,34 @@ class Deduplicator:
             return False
         threshold = ENTITY_SIM_THRESHOLD if kind == "entity" else NAME_SIM_THRESHOLD
         return cosine(keep_vector, drop_vector) >= threshold
+
+    @staticmethod
+    def string_match(keep: IndexBase, drop: IndexBase) -> bool:
+        """名字/别名是否字符串相等（归一化后），只用于召回，不作为合并判据。"""
+        if Deduplicator.normalize(keep.name) == Deduplicator.normalize(drop.name):
+            return True
+        if keep.name and keep.name in drop.relate_name:
+            return True
+        if drop.name and drop.name in keep.relate_name:
+            return True
+        # 别名集合有交集
+        return any(name in drop.relate_name for name in keep.relate_name)
+
+    def _entity_cosine_merge(self, keep: IndexBase, drop: IndexBase) -> bool:
+        """实体直合：两边都有画像、类型不冲突、余弦 ≥ 阈值，且名字不相等。"""
+        keep_entity = self.graph.entities.get(keep.unique_id)
+        drop_entity = self.graph.entities.get(drop.unique_id)
+        if (
+            keep_entity is None
+            or drop_entity is None
+            or not self._entities_compatible(keep_entity, drop_entity)
+        ):
+            return False
+        keep_vector = self._index_vector(keep, "entity")
+        drop_vector = self._index_vector(drop, "entity")
+        if not keep_vector or not drop_vector:
+            return False
+        return cosine(keep_vector, drop_vector) >= ENTITY_SIM_THRESHOLD
 
     # ---- 流程入口 ----
 
